@@ -12,7 +12,7 @@ using namespace std;
 template <const int BLOCK_SIZE_M, const int BLOCK_SIZE_K, const int BLOCK_SIZE_N, const int THREAD_SIZE_M, const int THREAD_SIZE_N >
 __global__ void double_buffer(float* __restrict__ A, float*  __restrict__ B, float*  __restrict__ C, const int M, const int K, const int N, float alpha, float beta)
 {
-//grid<n/bn,m/bm>，block<bn/tn,bm/tm>
+    //grid<n/bn,m/bm>，block<bn/tn,bm/tm>
     __shared__ float As[2][BLOCK_SIZE_M][BLOCK_SIZE_K];
     __shared__ float Bs[2][BLOCK_SIZE_K][BLOCK_SIZE_N];
     float accm[THREAD_SIZE_M][THREAD_SIZE_N]={0};
@@ -111,6 +111,18 @@ int main(void) {
         }
     }
     clock_t iStart;
+    cudaMemcpy(d_A,h_A,m*k*sizeof(float),cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B,h_B,k*n*sizeof(float),cudaMemcpyHostToDevice);
+
+    cout<<"开始cuBLAS计算:"<<" ";
+    iStart = clock();
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N, n, m, k, &a, d_B, n , d_A, k, &b ,d_C, n);
+    cudaDeviceSynchronize();
+    cout<<"elapsed:"<<(clock()-iStart)/1000.0<<"ms"<<endl;
+    cudaMemcpy(tmp_C,d_C,m*n*sizeof(float),cudaMemcpyDeviceToHost);
+
     int tile_k,n_block;
     n_block = (n+BLOCK_SIZE_N-1)/BLOCK_SIZE_N;
     tile_k = (m+BLOCK_SIZE_M-1)/BLOCK_SIZE_M;
@@ -119,7 +131,7 @@ int main(void) {
     double_buffer<BLOCK_SIZE_M , BLOCK_SIZE_K , BLOCK_SIZE_N , THREAD_SIZE_M , THREAD_SIZE_N > <<<dim3(n_block,tile_k,1), dim3(BLOCK_SIZE_N/THREAD_SIZE_N, BLOCK_SIZE_M/THREAD_SIZE_M, 1)>>>(d_A,d_B,d_C,m,k,n,a,b);
     cudaDeviceSynchronize();
     cout<<"elapsed:"<<(clock()-iStart)/1000.0<<"ms"<<endl;
-    cudaMemcpy(h_C,d_C,m*n*sizeof(float),cudaMemcpyDevicetoHost);
+    cudaMemcpy(h_C,d_C,m*n*sizeof(float),cudaMemcpyDeviceToHost);
 
     for(int i=0;i<m;i++){
         for(int j=0;j<n;j++){
