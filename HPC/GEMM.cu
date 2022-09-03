@@ -1,17 +1,55 @@
 #include <cuda_runtime.h> 
-#include "cublas_v2.h"
+#include <cublas_v2.h>
 #include <iostream> 
 #include <stdio.h>
 #include <ctime>
 #include <vector>
 using namespace std;
-// 定义测试矩阵的维度 
 
-#define OFFSET(row,col,ld)((row)*(ld)+(col))
+#define OFFSET(row,col,ld) ((row)*(ld)+(col))
 #define FETCH_FLOAT4(pointer)(reinterpret_cast<float4*>(&(pointer))[0])
-template <const int BLOCK_SIZE_M, const int BLOCK_SIZE_K, const int BLOCK_SIZE_N, const int THREAD_SIZE_M, const int THREAD_SIZE_N >
-__global__ void double_buffer(float* __restrict__ A, float*  __restrict__ B, float*  __restrict__ C, const int M, const int K, const int N, float alpha, float beta)
-{
+__global__void naive_MatrixMul(float *__restrict__ A, float *__restrict__ B, float *__restrict__ C, const int M, const int K, const int N, float alpha, float beta){
+    // grid<n/blockDim.x,m/blockDim.y>, block<32,Dimy>
+    float accm=0;
+
+    int Arow = blockIdx.y*blockDim.y+threadIdx.y;
+    int Bcol = blockIdx.x*blockDim.x+threadIdx.x;
+
+    for(int i=0;i<K;i++){
+        accm += A[OFFSET(Arow,i,K)]*B[OFFSET(i,Bcol,N)];
+    }
+    C[OFFSET(Arow,Bcol,N)] = accm;
+}
+__global__void Coalesed_MatrixMul(float *__restrict__ A, float *__restrict__ B, float *__restrict__ C, const int M, const int K, const int N, float alpha, float beta){
+    // grid<n/blockDim.x,m/blockDim.y>, block<32,Dimy>
+    extern __shared__ float sh[];
+    int sm_offset = threadIdx.y<<5;
+    int thread_idx = sm_offset + threadIdx.x;
+
+    int cid = blockIdx.y<<5 + threadIdx.x;
+    int rid = blockDim.y*blockIdx.x + threadIdx.y;
+
+    if(rid<M){
+        int lb = 0;
+        int hb = K;
+        int ptr = lb+threadIdx.x;
+        float accm = 0;
+        for(int jj=lb;jj<hb;jj+=32){
+            if(ptr<hb){
+                sh[thread_idx] = A[OFFSET(rid,ptr,K)];
+            }
+            __syncwarp();
+            ptr += 32;
+            for(int kk=0;kk<32&&jj+kk<hb;kk++){
+                accm += sh[sm_offset+kk]*B[OFFSET(jj+kk,cid,N)];
+            }
+            __syncwarp();
+        }
+        C[OFFSET(Arow,Bcol,N)] = accm;
+    }
+}
+template <const int BLOCK_SIZE_M, const int BLOCK_SIZE_K, const int BLOCK_SIZE_N, const int THREAD_SIZE_M, const int THREAD_SIZE_N>
+__global__void SMEM_buffer(float *__restrict__ A, float *__restrict__ B, float *__restrict__ C, const int M, const int K, const int N, float alpha, float beta){
     //grid<n/bn,m/bm>，block<bn/tn,bm/tm>
     __shared__ float As[2][BLOCK_SIZE_M][BLOCK_SIZE_K];
     __shared__ float Bs[2][BLOCK_SIZE_K][BLOCK_SIZE_N];
@@ -78,7 +116,35 @@ __global__ void double_buffer(float* __restrict__ A, float*  __restrict__ B, flo
         }
     }
 }
+template <const int BLOCK_SIZE_M, const int BLOCK_SIZE_K, const int BLOCK_SIZE_N, const int THREAD_SIZE_M, const int THREAD_SIZE_N>
+__global__void MatrixMul(float *__restrict__ A, float *__restrict__ B, float *__restrict__ C, const int M, const int K, const int N, float alpha, float beta){
+    //grid<n/bn,m/bm>，block<bn/tn,bm/tm>
+    float accm[THREAD_SIZE_M][THREAD_SIZE_N]={0};
+    float reg_a[THREAD_SIZE_M],reg_b[THREAD_SIZE_N];
+    int Arow0 = blockIdx.y*BLOCK_SIZE_M, Bcol0 = blockIdx.x*BLOCK_SIZE_N;
+    int tArow0 = threadIdx.y*THREAD_SIZE_M, tBcol0 = threadIdx.x*THREAD_SIZE_N;
 
+    for(ki=0;ki<K0;ki++){
+        for(int j=0;j<THREAD_SIZE_M;j++){
+            reg_a[j] = A[OFFSET(Arow0+tArow0+j,ki,K)];
+        }
+        for(int j=0;j<THREAD_SIZE_N;j+=4){
+            FETCH_FLOAT4(reg_b[j]) = FETCH_FLOAT4(B[OFFSET(ki,Brow0+tBrow0+j,N)]);
+        }
+        //进行小迭代
+        //两层循坏计算结果
+        for(int j=0;j<THREAD_SIZE_M;j++){
+            for(int k=0;k<THREAD_SIZE_N;k++){
+                accm[j][k] += reg_a[j]*reg_b[k];
+            }
+        }
+    }
+    for(int j=0;j<THREAD_SIZE_M;j++){
+        for(int k=0;k<THREAD_SIZE_N;k+=4){
+            FETCH_FLOAT4(C[ OFFSET(Arow0+tArow0+j,Bcol0+tBcol0+k,N) ]) = FETCH_FLOAT4(accm[j][k]);
+        }
+    }
+}
 int main(void) {
     int dev = 0;
     cudaDeviceProp deviceProp;
@@ -128,7 +194,7 @@ int main(void) {
     tile_k = (m+BLOCK_SIZE_M-1)/BLOCK_SIZE_M;
     cout<<"开始gemm计算:"<<tile_k<<", "<<n_block<<" ";
     iStart = clock();
-    double_buffer<BLOCK_SIZE_M , BLOCK_SIZE_K , BLOCK_SIZE_N , THREAD_SIZE_M , THREAD_SIZE_N > <<<dim3(n_block,tile_k,1), dim3(BLOCK_SIZE_N/THREAD_SIZE_N, BLOCK_SIZE_M/THREAD_SIZE_M, 1)>>>(d_A,d_B,d_C,m,k,n,a,b);
+    SMEM_buffer<BLOCK_SIZE_M , BLOCK_SIZE_K , BLOCK_SIZE_N , THREAD_SIZE_M , THREAD_SIZE_N > <<<dim3(n_block,tile_k,1), dim3(BLOCK_SIZE_N/THREAD_SIZE_N, BLOCK_SIZE_M/THREAD_SIZE_M, 1)>>>(d_A,d_B,d_C,m,k,n,a,b);
     cudaDeviceSynchronize();
     cout<<"elapsed:"<<(clock()-iStart)/1000.0<<"ms"<<endl;
     cudaMemcpy(h_C,d_C,m*n*sizeof(float),cudaMemcpyDeviceToHost);
