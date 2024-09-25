@@ -1,2 +1,0 @@
-sum_data用于生成训练集和验证集
-运行mol_main.py即可开始训练
